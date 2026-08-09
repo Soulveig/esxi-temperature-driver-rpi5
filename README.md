@@ -1,5 +1,9 @@
 # Raspberry Pi 5 temperature and fan controller for ESXi-Arm
 
+[English](#english) | [Русский](#русская-версия) | [Releases](https://github.com/Soulveig/esxi-driver-temperature-rpi5/releases)
+
+## English
+
 `rpitherm` is a VMware ESXi-Arm VMkernel module for Raspberry Pi 5. It reads
 the BCM2712 temperature through the VideoCore property mailbox and controls the
 three-wire fan on Waveshare PoE HAT (F) Rev1.2 through RP1 PWM1 channel 3.
