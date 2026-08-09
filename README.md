@@ -17,7 +17,7 @@ three-wire fan on Waveshare PoE HAT (F) Rev1.2 through RP1 PWM1 channel 3.
 
 - Raspberry Pi 5;
 - VMware ESXi-Arm 8.0U3c build 24449057;
-- [Soulveig Raspberry Pi 5 UEFI](https://github.com/Soulveig/rpi5-uefi-soulveig-edition) 0.2.2;
+- [RPI 5 UEFI 0.2.2 [Soulveig Edition]](https://github.com/Soulveig/rpi5-uefi-soulveig-edition/releases/tag/v0.2.2);
 - ACPI device `FANC` / `RPI0003` supplied by that UEFI;
 - Secure Boot disabled and `CommunitySupported` acceptance level.
 
@@ -79,7 +79,7 @@ read temperature or complete initialization.
 
 - Raspberry Pi 5;
 - VMware ESXi-Arm 8.0U3c build 24449057;
-- [Soulveig Raspberry Pi 5 UEFI](https://github.com/Soulveig/rpi5-uefi-soulveig-edition) 0.2.2;
+- [RPI 5 UEFI 0.2.2 [Soulveig Edition]](https://github.com/Soulveig/rpi5-uefi-soulveig-edition/releases/tag/v0.2.2);
 - ACPI-устройство `FANC` / `RPI0003` из этого UEFI;
 - отключённый Secure Boot и уровень `CommunitySupported`.
 
