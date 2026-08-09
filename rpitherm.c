@@ -1,10 +1,11 @@
 /*
- * rpitherm v0.4.4: periodic Raspberry Pi 5 SoC temperature probe.
+ * rpitherm v0.5.0: Raspberry Pi 5 temperature and fan controller.
  *
  * The module binds only to the UEFI ACPI mailbox device BCM2849 (RPIQ).
- * It does not bind to RP1 Ethernet, SD/MMC, or PWM resources and does not
- * allocate or register an interrupt.  The sole hardware write submits the
- * standard firmware property-mailbox GET_TEMPERATURE request.
+ * It does not bind to RP1 Ethernet or SD/MMC and does not allocate or
+ * register an interrupt.  In addition to the firmware property mailbox it
+ * maps four narrow ACPI resources for RP1 clocks, PWM1, GPIO bank 2, and pads
+ * bank 2.  It never maps the shared RP1 interrupt or the complete RP1 BAR.
  *
  * The low-memory page has no confirmed unload-time release API in the
  * available ESXi-Arm ABI. Install, update, and remove this module only through
@@ -78,6 +79,36 @@ extern uint32_t vmk_ModuleCurrentID;
 #define RPITHERM_DMA_PHYS_MASK   0x3fffffffULL
 #define RPITHERM_DMA_BUS_ALIAS   0xc0000000U
 #define RPITHERM_DMA_BUFFER_SIZE 4096U
+#define RPITHERM_POLL_INTERVAL_US 5000000ULL
+
+#define RPITHERM_CLOCK_CTRL_OFFSET      0x084U
+#define RPITHERM_CLOCK_DIV_INT_OFFSET   0x088U
+#define RPITHERM_CLOCK_DIV_FRAC_OFFSET  0x08cU
+#define RPITHERM_CLOCK_SEL_OFFSET       0x090U
+#define RPITHERM_CLOCK_CTRL_ENABLE      (1U << 11)
+#define RPITHERM_CLOCK_CTRL_LOW_MASK    0x3ffU
+#define RPITHERM_CLOCK_CTRL_50MHZ       0x040U
+
+#define RPITHERM_PWM_GLOBAL_CTRL_OFFSET 0x000U
+#define RPITHERM_PWM_CHANNEL_CTRL       0x044U
+#define RPITHERM_PWM_CHANNEL_RANGE      0x048U
+#define RPITHERM_PWM_CHANNEL_DUTY       0x050U
+#define RPITHERM_PWM_CHANNEL_DEFAULT    ((1U << 8) | (1U << 0))
+#define RPITHERM_PWM_POLARITY_INVERTED  (1U << 3)
+#define RPITHERM_PWM_CHANNEL_ENABLE     (1U << 3)
+#define RPITHERM_PWM_SET_UPDATE         (1U << 31)
+#define RPITHERM_PWM_RANGE              2078U
+#define RPITHERM_PWM_DUTY_MAX           2038U
+
+#define RPITHERM_GPIO45_CTRL_OFFSET     ((11U * 8U) + 0x004U)
+#define RPITHERM_GPIO_FUNCSEL_MASK      0x01fU
+#define RPITHERM_GPIO_OUTOVER_MASK      0x3000U
+#define RPITHERM_GPIO_OEOVER_MASK       0xc000U
+#define RPITHERM_PAD45_CTRL_OFFSET      (11U * 4U)
+#define RPITHERM_PAD_OUT_DISABLE        (1U << 7)
+#define RPITHERM_PAD_INPUT_ENABLE       (1U << 6)
+#define RPITHERM_PAD_PULL_MASK          ((1U << 3) | (1U << 2))
+#define RPITHERM_PAD_PULL_DOWN          (1U << 2)
 
 struct rpitherm_memory_pool_props {
     uint8_t name[32];
@@ -143,6 +174,10 @@ _Static_assert(sizeof(struct rpitherm_world_props) == 48,
 static void *rpitherm_memory_pool;
 static void *rpitherm_lowmem_page;
 static uint8_t rpitherm_mailbox_resource[64] __attribute__((aligned(8)));
+static uint8_t rpitherm_clock_resource[64] __attribute__((aligned(8)));
+static uint8_t rpitherm_pwm_resource[64] __attribute__((aligned(8)));
+static uint8_t rpitherm_gpio_resource[64] __attribute__((aligned(8)));
+static uint8_t rpitherm_pad_resource[64] __attribute__((aligned(8)));
 static vmk_ACPIDevice rpitherm_acpi_device;
 static uint64_t rpitherm_machine_address;
 static uint32_t rpitherm_bus_address;
@@ -150,6 +185,8 @@ static volatile uint32_t rpitherm_world_stop;
 static volatile uint32_t rpitherm_world_running;
 static volatile uint32_t rpitherm_world_id;
 static volatile uint32_t rpitherm_world_reads;
+static volatile uint32_t rpitherm_fan_percent = 100U;
+static volatile uint32_t rpitherm_fan_ready;
 
 struct rpitherm_request {
     uint32_t buffer_size;
@@ -291,7 +328,7 @@ rpitherm_transaction(void *resource, struct rpitherm_request *request,
 }
 
 static vmk_Status
-rpitherm_temperature_from_lowmem(void *resource)
+rpitherm_temperature_from_lowmem(void *resource, uint32_t *temperature)
 {
     struct rpitherm_memory_pool_props pool_props = {
         { 0 }, 0, 0, 0, 1, 0, { 0, 0 },
@@ -368,6 +405,7 @@ rpitherm_temperature_from_lowmem(void *resource)
         (request->tag_value_size & RPITHERM_RESPONSE_OK) != 0U &&
         (request->tag_value_size & ~RPITHERM_RESPONSE_OK) >= 4U &&
         request->value >= 10000U && request->value <= 120000U) {
+        *temperature = request->value;
         _vmk_WarningMessage(
             "rpitherm: temperature=%u mC (%u.%03u C) ma=%08x bus=%08x",
             request->value, request->value / 1000U,
@@ -385,7 +423,7 @@ rpitherm_temperature_from_lowmem(void *resource)
 }
 
 static vmk_Status
-rpitherm_repeat_temperature(void)
+rpitherm_repeat_temperature(uint32_t *temperature)
 {
     struct rpitherm_request *request =
         (struct rpitherm_request *)rpitherm_lowmem_page;
@@ -413,10 +451,14 @@ rpitherm_repeat_temperature(void)
         (request->tag_value_size & ~RPITHERM_RESPONSE_OK) >= 4U &&
         request->value >= 10000U && request->value <= 120000U) {
         rpitherm_world_reads++;
-        _vmk_WarningMessage(
-            "rpitherm: periodic temperature=%u mC (%u.%03u C) read=%u",
-            request->value, request->value / 1000U,
-            request->value % 1000U, rpitherm_world_reads);
+        *temperature = request->value;
+        if ((rpitherm_world_reads % 12U) == 0U)
+            _vmk_WarningMessage(
+                "rpitherm: periodic temperature=%u mC (%u.%03u C) "
+                "read=%u fan=%u%%",
+                request->value, request->value / 1000U,
+                request->value % 1000U, rpitherm_world_reads,
+                rpitherm_fan_percent);
         return 0;
     }
     _vmk_WarningMessage(
@@ -428,21 +470,187 @@ rpitherm_repeat_temperature(void)
 }
 
 static vmk_Status
+rpitherm_read32(const void *resource, uint64_t offset, uint32_t *value)
+{
+    return vmk_MappedResourceRead32(resource, offset, value);
+}
+
+static vmk_Status
+rpitherm_write32(void *resource, uint64_t offset, uint32_t value)
+{
+    vmk_Status status = vmk_MappedResourceWrite32(resource, offset, value);
+
+    __asm__ volatile("dsb ish" ::: "memory");
+    return status;
+}
+
+static vmk_Status
+rpitherm_fan_configure(void)
+{
+    uint32_t value;
+    vmk_Status status;
+
+    status = rpitherm_write32(rpitherm_clock_resource,
+                              RPITHERM_CLOCK_DIV_INT_OFFSET, 1U);
+    if (status == 0)
+        status = rpitherm_write32(rpitherm_clock_resource,
+                                  RPITHERM_CLOCK_DIV_FRAC_OFFSET, 0U);
+    if (status == 0)
+        status = rpitherm_write32(rpitherm_clock_resource,
+                                  RPITHERM_CLOCK_SEL_OFFSET, 1U);
+    if (status == 0)
+        status = rpitherm_read32(rpitherm_clock_resource,
+                                 RPITHERM_CLOCK_CTRL_OFFSET, &value);
+    if (status == 0) {
+        value &= ~RPITHERM_CLOCK_CTRL_LOW_MASK;
+        value |= RPITHERM_CLOCK_CTRL_50MHZ | RPITHERM_CLOCK_CTRL_ENABLE;
+        status = rpitherm_write32(rpitherm_clock_resource,
+                                  RPITHERM_CLOCK_CTRL_OFFSET, value);
+    }
+
+    if (status == 0)
+        status = rpitherm_read32(rpitherm_pad_resource,
+                                 RPITHERM_PAD45_CTRL_OFFSET, &value);
+    if (status == 0) {
+        value &= ~(RPITHERM_PAD_OUT_DISABLE | RPITHERM_PAD_PULL_MASK);
+        value |= RPITHERM_PAD_INPUT_ENABLE | RPITHERM_PAD_PULL_DOWN;
+        status = rpitherm_write32(rpitherm_pad_resource,
+                                  RPITHERM_PAD45_CTRL_OFFSET, value);
+    }
+
+    if (status == 0)
+        status = rpitherm_read32(rpitherm_gpio_resource,
+                                 RPITHERM_GPIO45_CTRL_OFFSET, &value);
+    if (status == 0) {
+        value &= ~(RPITHERM_GPIO_FUNCSEL_MASK |
+                   RPITHERM_GPIO_OUTOVER_MASK |
+                   RPITHERM_GPIO_OEOVER_MASK);
+        status = rpitherm_write32(rpitherm_gpio_resource,
+                                  RPITHERM_GPIO45_CTRL_OFFSET, value);
+    }
+
+    if (status == 0)
+        status = rpitherm_write32(
+            rpitherm_pwm_resource, RPITHERM_PWM_CHANNEL_CTRL,
+            RPITHERM_PWM_CHANNEL_DEFAULT | RPITHERM_PWM_POLARITY_INVERTED);
+    if (status == 0)
+        status = rpitherm_write32(rpitherm_pwm_resource,
+                                  RPITHERM_PWM_CHANNEL_RANGE,
+                                  RPITHERM_PWM_RANGE);
+    if (status == 0)
+        status = rpitherm_write32(rpitherm_pwm_resource,
+                                  RPITHERM_PWM_CHANNEL_DUTY,
+                                  RPITHERM_PWM_DUTY_MAX);
+    if (status == 0)
+        status = rpitherm_read32(rpitherm_pwm_resource,
+                                 RPITHERM_PWM_GLOBAL_CTRL_OFFSET, &value);
+    if (status == 0) {
+        value |= RPITHERM_PWM_CHANNEL_ENABLE;
+        status = rpitherm_write32(rpitherm_pwm_resource,
+                                  RPITHERM_PWM_GLOBAL_CTRL_OFFSET, value);
+    }
+    if (status == 0)
+        status = rpitherm_write32(rpitherm_pwm_resource,
+                                  RPITHERM_PWM_GLOBAL_CTRL_OFFSET,
+                                  value | RPITHERM_PWM_SET_UPDATE);
+
+    rpitherm_fan_ready = status == 0;
+    return status;
+}
+
+static vmk_Status
+rpitherm_fan_set(uint32_t percent, const char *reason)
+{
+    uint32_t duty;
+    uint32_t verify = 0;
+    vmk_Status status;
+
+    if (percent > 100U)
+        percent = 100U;
+    if (rpitherm_fan_ready == 0)
+        return (vmk_Status)0x0bad0005U;
+
+    duty = (RPITHERM_PWM_DUTY_MAX * percent + 50U) / 100U;
+    status = rpitherm_write32(rpitherm_pwm_resource,
+                              RPITHERM_PWM_CHANNEL_DUTY, duty);
+    if (status == 0)
+        status = rpitherm_read32(rpitherm_pwm_resource,
+                                 RPITHERM_PWM_GLOBAL_CTRL_OFFSET, &verify);
+    if (status == 0)
+        status = rpitherm_write32(rpitherm_pwm_resource,
+                                  RPITHERM_PWM_GLOBAL_CTRL_OFFSET,
+                                  verify | RPITHERM_PWM_CHANNEL_ENABLE |
+                                      RPITHERM_PWM_SET_UPDATE);
+    if (status == 0)
+        status = rpitherm_read32(rpitherm_pwm_resource,
+                                 RPITHERM_PWM_CHANNEL_DUTY, &verify);
+    if (status == 0 && verify != duty)
+        status = (vmk_Status)0x0bad0006U;
+    if (status == 0) {
+        if (rpitherm_fan_percent != percent)
+            _vmk_WarningMessage(
+                "rpitherm: fan changed old=%u%% new=%u%% duty=%u reason=%s",
+                rpitherm_fan_percent, percent, duty, reason);
+        rpitherm_fan_percent = percent;
+    } else {
+        _vmk_WarningMessage(
+            "rpitherm: fan write failed status=%x requested=%u%% "
+            "duty=%u verify=%u reason=%s",
+            status, percent, duty, verify, reason);
+    }
+    return status;
+}
+
+static uint32_t
+rpitherm_fan_target(uint32_t temperature)
+{
+    uint32_t current = rpitherm_fan_percent;
+
+    if (temperature >= 75000U)
+        return 100U;
+    if (current == 100U && temperature >= 70000U)
+        return 100U;
+    if (temperature >= 67500U)
+        return 70U;
+    if (current >= 70U && temperature >= 62500U)
+        return 70U;
+    if (temperature >= 60000U)
+        return 50U;
+    if (current >= 50U && temperature >= 55000U)
+        return 50U;
+    if (temperature >= 50000U)
+        return 30U;
+    if (current >= 30U && temperature >= 45000U)
+        return 30U;
+    return 0U;
+}
+
+static vmk_Status
 rpitherm_poll_world(void *data)
 {
+    uint32_t temperature;
+    uint32_t target;
+    vmk_Status read_status;
     vmk_Status sleep_status;
 
     (void)data;
-    _vmk_WarningMessage("rpitherm: periodic world entered intervalUsec=60000000");
+    _vmk_WarningMessage("rpitherm: fan world entered intervalUsec=5000000");
     while (rpitherm_world_stop == 0) {
-        sleep_status = vmk_WorldSleep(60000000ULL);
+        sleep_status = vmk_WorldSleep(RPITHERM_POLL_INTERVAL_US);
         if (rpitherm_world_stop != 0)
             break;
         if (sleep_status != 0) {
             rpitherm_world_running = 0;
             return sleep_status;
         }
-        (void)rpitherm_repeat_temperature();
+        read_status = rpitherm_repeat_temperature(&temperature);
+        if (read_status != 0) {
+            (void)rpitherm_fan_set(100U, "temperature-read-failure");
+            continue;
+        }
+        target = rpitherm_fan_target(temperature);
+        if (target != rpitherm_fan_percent)
+            (void)rpitherm_fan_set(target, "temperature-curve");
     }
     rpitherm_world_running = 0;
     return 0;
@@ -499,6 +707,9 @@ rpitherm_attach(vmk_Device device)
     vmk_ACPIDevice acpi_device = 0;
     uint8_t *resource = rpitherm_mailbox_resource;
     uint8_t acpi_info[256] __attribute__((aligned(8))) = { 0 };
+    uint32_t temperature = 0;
+    uint32_t target;
+    uint32_t mapped_resources = 0;
     vmk_Status status;
 
     status = vmk_DeviceGetRegistrationData(device, (void **)&acpi_device);
@@ -514,15 +725,62 @@ rpitherm_attach(vmk_Device device)
                             status);
         return status;
     }
+    mapped_resources = 1;
     rpitherm_acpi_device = acpi_device;
 
-    /* One standard GET_TEMPERATURE transaction; no PWM or IRQ access. */
-    status = rpitherm_temperature_from_lowmem(resource);
+    status = vmk_ACPIMapIOResource(vmk_ModuleCurrentID, acpi_device, 1,
+                                   rpitherm_clock_resource);
+    if (status == 0) {
+        mapped_resources = 2;
+        status = vmk_ACPIMapIOResource(vmk_ModuleCurrentID, acpi_device, 2,
+                                       rpitherm_pwm_resource);
+    }
+    if (status == 0) {
+        mapped_resources = 3;
+        status = vmk_ACPIMapIOResource(vmk_ModuleCurrentID, acpi_device, 3,
+                                       rpitherm_gpio_resource);
+    }
+    if (status == 0) {
+        mapped_resources = 4;
+        status = vmk_ACPIMapIOResource(vmk_ModuleCurrentID, acpi_device, 4,
+                                       rpitherm_pad_resource);
+    }
+    if (status == 0)
+        mapped_resources = 5;
+    if (status != 0) {
+        _vmk_WarningMessage(
+            "rpitherm: fan resource map failed status=%x; refusing PWM",
+            status);
+        goto attach_fail;
+    }
+
+    status = rpitherm_fan_configure();
+    if (status == 0)
+        status = rpitherm_fan_set(100U, "attach-fail-safe");
+    if (status == 0)
+        status = rpitherm_temperature_from_lowmem(resource, &temperature);
+    if (status == 0) {
+        target = rpitherm_fan_target(temperature);
+        status = rpitherm_fan_set(target, "initial-temperature");
+    }
     if (status == 0)
         status = rpitherm_start_poll_world();
     _vmk_WarningMessage(
-        "rpitherm: periodic temperature probe ready status=%x", status);
-    return 0;
+        "rpitherm: temperature and fan controller ready status=%x", status);
+    if (status == 0)
+        return 0;
+
+attach_fail:
+    if (rpitherm_fan_ready != 0)
+        (void)rpitherm_fan_set(100U, "attach-failure");
+    while (mapped_resources != 0U) {
+        mapped_resources--;
+        (void)vmk_ACPIUnmapIOResource(
+            vmk_ModuleCurrentID, acpi_device, mapped_resources);
+    }
+    rpitherm_acpi_device = 0;
+    rpitherm_fan_ready = 0;
+    return status;
 }
 
 static vmk_Status
@@ -539,10 +797,21 @@ rpitherm_stop_device(vmk_Device device)
 
     (void)device;
     rpitherm_stop_poll_world();
+    if (rpitherm_fan_ready != 0)
+        (void)rpitherm_fan_set(100U, "device-stop-fail-safe");
     if (rpitherm_acpi_device != 0) {
+        (void)vmk_ACPIUnmapIOResource(
+            vmk_ModuleCurrentID, rpitherm_acpi_device, 4);
+        (void)vmk_ACPIUnmapIOResource(
+            vmk_ModuleCurrentID, rpitherm_acpi_device, 3);
+        (void)vmk_ACPIUnmapIOResource(
+            vmk_ModuleCurrentID, rpitherm_acpi_device, 2);
+        (void)vmk_ACPIUnmapIOResource(
+            vmk_ModuleCurrentID, rpitherm_acpi_device, 1);
         status = vmk_ACPIUnmapIOResource(
             vmk_ModuleCurrentID, rpitherm_acpi_device, 0);
         rpitherm_acpi_device = 0;
+        rpitherm_fan_ready = 0;
     }
     return status;
 }
@@ -565,7 +834,7 @@ static const char __vmk_nsRequiredInfo_str[] =
     "nsRequired=com.vmware.vmkapi#v3_0_0_0";
 __attribute__((section(".vmkmodinfo"), used, aligned(8)))
 static const char __vmk_versionInfo_str[] =
-    "version=0.4.4-1rpitherm.803.0.55.24449057";
+    "version=0.5.0-0dev1rpitherm.803.0.55.24449057";
 __attribute__((section(".vmkmodinfo"), used, aligned(8)))
 static const char __vmk_buildTypeInfo_str[] = "buildType=release";
 __attribute__((section(".vmkmodinfo"), used, aligned(8)))
