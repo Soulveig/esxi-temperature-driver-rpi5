@@ -1,196 +1,110 @@
-# Native Raspberry Pi 5 temperature monitor for ESXi-Arm
+# Raspberry Pi 5 temperature and fan controller for ESXi-Arm
 
-`rpitherm` is a read-only VMware ESXi-Arm VMkernel module that reads the
-Raspberry Pi 5 SoC temperature through the standard Raspberry Pi firmware
-property mailbox.
-
-## Contents
-
-- [Features](#features)
-- [Compatibility](#compatibility)
-- [Firmware requirement](#firmware-requirement)
-- [Installation](#installation)
-- [Verification](#verification)
-- [Update and removal](#update-and-removal)
-- [Safety and limitations](#safety-and-limitations)
-- [Files](#files)
-- [Русская версия](#русская-версия)
+`rpitherm` is a VMware ESXi-Arm VMkernel module for Raspberry Pi 5. It reads
+the BCM2712 temperature through the VideoCore property mailbox and controls the
+three-wire fan on Waveshare PoE HAT (F) Rev1.2 through RP1 PWM1 channel 3.
 
 ## Features
 
-- Reads the BCM2712 SoC temperature in millidegrees Celsius.
-- Performs one read during device attachment and one periodic read every 60 seconds.
-- Uses the ACPI `RPIQ` / `BCM2849` mailbox device exposed by the required UEFI.
-- Does not bind to the RP1 Ethernet or SD/MMC controllers.
-- Does not access PWM, GPIO, or fan-control registers.
-- Does not register interrupts.
+- temperature polling every 5 seconds, with a periodic log record every minute;
+- automatic fan curve: 0 / 30 / 50 / 70 / 100% at below 50 / 50 / 60 / 67.5 / 75 C;
+- 5 C downward hysteresis;
+- 100% fail-safe on startup, temperature-read failure, attach failure, and stop;
+- no interrupt registration, including no use of shared RP1 interrupt 261;
+- no access to RP1 Ethernet or SD/MMC controller registers.
 
 ## Compatibility
 
-- Raspberry Pi 5.
-- VMware ESXi-Arm 8.0U3c build 24449057.
-- Soulveig Raspberry Pi 5 UEFI 0.2.1 with ACPI `RPIQ` / `BCM2849`.
-- Secure Boot disabled.
-- `CommunitySupported` acceptance level.
-
-## Firmware requirement
-
-The module requires the modified Raspberry Pi 5 UEFI from
-[Soulveig/rpi5-uefi-soulveig-edition](https://github.com/Soulveig/rpi5-uefi-soulveig-edition).
-The firmware exposes the Raspberry Pi property mailbox as an ACPI device with a
-single MMIO resource. Stock UEFI images without this ACPI device are not
-supported.
+- Raspberry Pi 5;
+- VMware ESXi-Arm 8.0U3c build 24449057;
+- [Soulveig Raspberry Pi 5 UEFI](https://github.com/Soulveig/rpi5-uefi-soulveig-edition) 0.2.2;
+- ACPI device `FANC` / `RPI0003` supplied by that UEFI;
+- Secure Boot disabled and `CommunitySupported` acceptance level.
 
 ## Installation
 
-Copy the offline bundle to the ESXi host and run a dry-run first:
+Use the offline bundle and perform a dry run first:
 
 ```console
-esxcli software vib update -d /tmp/rpitherm-0.4.4-1-offline-bundle.zip --dry-run --no-sig-check --force
-```
-
-The dry-run must install only `rpitherm`, use `BootBankInstaller`, and report
-that a reboot is required. Then install and reboot:
-
-```console
-esxcli software vib update -d /tmp/rpitherm-0.4.4-1-offline-bundle.zip --no-sig-check --force
+esxcli software vib update -d /tmp/rpitherm-0.5.0-3-offline-bundle.zip --dry-run --no-sig-check --force
+esxcli software vib update -d /tmp/rpitherm-0.5.0-3-offline-bundle.zip --no-sig-check --force
 reboot
 ```
 
-Keep the host in maintenance mode and preserve a tested altbootbank rollback.
+The dry run must select only `BootBankInstaller`, replace only `rpitherm`, and
+require a reboot. Live installation and live removal are disabled.
 
 ## Verification
 
-After reboot:
-
 ```console
-esxcli software vib get -n rpitherm
+esxcli software vib list | grep rpitherm
 vmkload_mod -l | grep rpitherm
-grep -o 'rpitherm: temperature=[0-9]* mC ([0-9.]* C)' /var/log/vmkernel.log
-grep -o 'rpitherm: periodic temperature=[0-9]* mC ([0-9.]* C) read=[0-9]*' /var/log/vmkernel.log
+dmesg | grep rpitherm
 ```
 
-A successful boot contains a numeric temperature, for example `41127 mC
-(41.127 C)`. Also verify the host network and storage devices independently.
+A successful boot contains a numeric temperature and fan transitions such as
+`fan changed old=70% new=50%`. Verify network and storage separately.
 
-## Update and removal
+## Safety
 
-Live installation and live removal are disabled. Install, update, or remove the
-VIB only through `BootBankInstaller` followed by a reboot. Do not repeatedly
-load and unload the module on a running host.
-
-## Safety and limitations
-
-- This is an unsigned `CommunitySupported` VIB for a specific ESXi-Arm build.
-- Temperature is written to `vmkernel.log`; no Host Client sensor integration is provided.
-- The module does not control the fan. UEFI fan behavior after `ExitBootServices`
-  is separate from this driver.
-- Keep local-console access and a tested rollback path available.
+This is an unsigned driver for one specific ESXi-Arm build. Preserve a known-good
+UEFI image and bootbank rollback. The module keeps the fan at 100% when it cannot
+read temperature or complete initialization.
 
 ## Files
 
-- `rpitherm-0.4.4-1-offline-bundle.zip` — recommended offline depot.
-- `rpitherm-0.4.4-1-community.vib` — standalone unsigned VIB.
-- `rpitherm.c` — VMkernel module source.
+- `rpitherm-0.5.0-3-offline-bundle.zip` — recommended offline depot;
+- `rpitherm-0.5.0-3-community.vib` — standalone unsigned VIB;
+- `rpitherm.c` — source of the hardware-tested module;
 - `SHA256SUMS` — release checksums.
 
 ---
 
 ## Русская версия
 
-`rpitherm` — модуль VMkernel для VMware ESXi-Arm, который только читает
-температуру SoC Raspberry Pi 5 через стандартный property mailbox прошивки
-Raspberry Pi.
-
-### Содержание
-
-- [Возможности](#возможности)
-- [Совместимость](#совместимость)
-- [Требование к UEFI](#требование-к-uefi)
-- [Установка](#установка)
-- [Проверка](#проверка)
-- [Обновление и удаление](#обновление-и-удаление)
-- [Безопасность и ограничения](#безопасность-и-ограничения)
-- [Файлы](#файлы)
+`rpitherm` — модуль VMkernel для Raspberry Pi 5 под VMware ESXi-Arm. Он читает
+температуру BCM2712 через VideoCore property mailbox и автоматически управляет
+трёхпроводным вентилятором Waveshare PoE HAT (F) Rev1.2 через RP1 PWM1 channel 3.
 
 ### Возможности
 
-- Чтение температуры BCM2712 в тысячных долях градуса Цельсия.
-- Одно чтение при подключении устройства и далее одно чтение каждые 60 секунд.
-- Работа через ACPI-устройство `RPIQ` / `BCM2849`, предоставленное требуемым UEFI.
-- Модуль не связывается с контроллерами Ethernet RP1 и SD/MMC.
-- Модуль не обращается к PWM, GPIO или регистрам управления вентилятором.
-- Модуль не регистрирует прерывания.
+- опрос температуры каждые 5 секунд и запись значения в журнал раз в минуту;
+- кривая 0 / 30 / 50 / 70 / 100% на порогах ниже 50 / 50 / 60 / 67,5 / 75 C;
+- гистерезис 5 C при охлаждении;
+- безопасные 100% при старте, ошибке температуры, attach или остановке;
+- отсутствие регистрации прерываний, включая общий RP1 IRQ 261;
+- отсутствие обращений к регистрам Ethernet RP1 и SD/MMC.
 
 ### Совместимость
 
-- Raspberry Pi 5.
-- VMware ESXi-Arm 8.0U3c build 24449057.
-- Soulveig Raspberry Pi 5 UEFI 0.2.1 с ACPI `RPIQ` / `BCM2849`.
-- Secure Boot отключён.
-- Уровень приёмки `CommunitySupported`.
-
-### Требование к UEFI
-
-Требуется модифицированный UEFI из репозитория
-[Soulveig/rpi5-uefi-soulveig-edition](https://github.com/Soulveig/rpi5-uefi-soulveig-edition).
-Он предоставляет property mailbox Raspberry Pi системе ESXi как ACPI-устройство
-с одним MMIO-ресурсом. Стандартные образы UEFI без этого ACPI-устройства не
-поддерживаются.
+- Raspberry Pi 5;
+- VMware ESXi-Arm 8.0U3c build 24449057;
+- [Soulveig Raspberry Pi 5 UEFI](https://github.com/Soulveig/rpi5-uefi-soulveig-edition) 0.2.2;
+- ACPI-устройство `FANC` / `RPI0003` из этого UEFI;
+- отключённый Secure Boot и уровень `CommunitySupported`.
 
 ### Установка
 
-Скопируйте offline bundle на хост ESXi и сначала выполните dry-run:
-
 ```console
-esxcli software vib update -d /tmp/rpitherm-0.4.4-1-offline-bundle.zip --dry-run --no-sig-check --force
-```
-
-Dry-run должен менять только `rpitherm`, использовать `BootBankInstaller` и
-требовать перезагрузку. После этого установите пакет и перезагрузите хост:
-
-```console
-esxcli software vib update -d /tmp/rpitherm-0.4.4-1-offline-bundle.zip --no-sig-check --force
+esxcli software vib update -d /tmp/rpitherm-0.5.0-3-offline-bundle.zip --dry-run --no-sig-check --force
+esxcli software vib update -d /tmp/rpitherm-0.5.0-3-offline-bundle.zip --no-sig-check --force
 reboot
 ```
 
-Хост должен находиться в maintenance mode. Сохраните проверенный rollback через
-altbootbank.
+Dry-run должен использовать только `BootBankInstaller`, менять только
+`rpitherm` и требовать перезагрузку. Live-установка и live-удаление отключены.
 
 ### Проверка
 
-После перезагрузки:
-
 ```console
-esxcli software vib get -n rpitherm
+esxcli software vib list | grep rpitherm
 vmkload_mod -l | grep rpitherm
-grep -o 'rpitherm: temperature=[0-9]* mC ([0-9.]* C)' /var/log/vmkernel.log
-grep -o 'rpitherm: periodic temperature=[0-9]* mC ([0-9.]* C) read=[0-9]*' /var/log/vmkernel.log
+dmesg | grep rpitherm
 ```
 
-В журнале должна присутствовать численная температура, например `41127 mC
-(41.127 C)`. Отдельно проверьте сеть и накопители хоста.
-
-### Обновление и удаление
-
-Live-установка и live-удаление отключены. Устанавливайте, обновляйте и удаляйте
-VIB только через `BootBankInstaller` с последующей перезагрузкой. Не выполняйте
-многократную загрузку и выгрузку модуля на работающем хосте.
-
-### Безопасность и ограничения
-
-- Это неподписанный VIB уровня `CommunitySupported` для конкретной сборки ESXi-Arm.
-- Температура записывается в `vmkernel.log`; интеграции с датчиками Host Client нет.
-- Модуль не управляет вентилятором. Поведение вентилятора UEFI после
-  `ExitBootServices` не относится к этому драйверу.
-- Сохраните доступ к локальной консоли и заранее проверенный путь отката.
-
-### Файлы
-
-- `rpitherm-0.4.4-1-offline-bundle.zip` — рекомендуемый offline depot.
-- `rpitherm-0.4.4-1-community.vib` — отдельный неподписанный VIB.
-- `rpitherm.c` — исходный код модуля VMkernel.
-- `SHA256SUMS` — контрольные суммы файлов релиза.
+При успешной загрузке журнал содержит численную температуру и смену ступеней
+вентилятора. Сеть и накопители проверяйте отдельно. Сохраните рабочий образ UEFI
+и путь отката bootbank.
 
 ## License
 
